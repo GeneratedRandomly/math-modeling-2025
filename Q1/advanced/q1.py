@@ -3,19 +3,24 @@ import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from matplotlib.patches import Polygon
 from scipy.optimize import minimize
-from colormath.color_objects import XYZColor, sRGBColor
+from colormath.color_objects import XYZColor, sRGBColor, LabColor
 from colormath.color_conversions import convert_color
+from colormath.color_diff import delta_e_cie2000
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 # 中文显示设置
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
 # 定义BT2020和显示屏RGB的三基色坐标(CIE 1931坐标)
-# 参考文献[4]中提到的BT2020标准
 BT2020_RED = (0.708, 0.292)
 BT2020_GREEN = (0.170, 0.797)
 BT2020_BLUE = (0.131, 0.046)
 
-# 假设显示屏的RGB三基色(实际上需要根据具体显示器校准获得)
+# 显示屏的RGB三基色
 DISPLAY_RED = (0.6946, 0.3047)
 DISPLAY_GREEN = (0.2612, 0.7076)
 DISPLAY_BLUE = (0.1418, 0.0417)
@@ -209,12 +214,78 @@ def optimize_conversion(bt2020_rgb):
     initial_diff = color_difference(bt2020_xyz, initial_xyz)
     final_diff = color_difference(bt2020_xyz, final_xyz)
     
-    # print(f"\n颜色优化分析 (RGB={bt2020_rgb}):")
-    # print(f"初始色差: {initial_diff:.6f}")
-    # print(f"优化后色差: {final_diff:.6f}")
-    # print(f"色差改善: {((initial_diff-final_diff)/initial_diff*100):.2f}%")
+    print(f"\n颜色优化分析 (RGB={bt2020_rgb}):")
+    print(f"初始色差: {initial_diff:.6f}")
+    print(f"优化后色差: {final_diff:.6f}")
+    print(f"色差改善: {((initial_diff-final_diff)/initial_diff*100):.2f}%")
 
     return np.clip(result.x, 0, 1)  # 确保结果在[0,1]范围内
+
+def analyze_conversion_accuracy():
+    """分析4通道到5通道转换的精度"""
+    # 创建测试颜色集
+    test_colors = [
+        np.array([1.0, 0.0, 0.0]),  # 纯R
+        np.array([0.0, 1.0, 0.0]),  # 纯G
+        np.array([0.5, 0.5, 0.0]),  # RG混合
+        np.array([0.5, 0.0, 0.5]),  # RB混合
+        np.array([0.4, 0.3, 0.3]),  # 均匀混合
+        np.array([0.5, 0.3, 0.2]),  # 复杂混合1
+        np.array([0.2, 0.4, 0.4]),  # 复杂混合2
+        np.array([0.3, 0.2, 0.5]),  # 复杂混合4
+    ]
+
+    # 获取颜色矩阵
+    BT2020_matrix, DISPLAY_matrix, _ = compute_primary_matrix()
+
+    # 存储结果
+    results = []
+    total_error = 0
+    max_error = 0
+    min_error = float('inf')
+
+    print("\n转换精度分析结果：")
+    print("=" * 50)
+    print("颜色\t\t\t源RGBV\t\t\t目标rgb\t\t\t色差(ΔE)")
+    print("-" * 100)
+
+    for i, color in enumerate(test_colors):
+        # 转换到5通道
+        display_rgb = convert_bt2020_to_display(color)
+
+        # 计算原始颜色和目标颜色的XYZ值
+        BT2020_xyz = np.dot(BT2020_matrix, color)
+        display_xyz = np.dot(DISPLAY_matrix, display_rgb)
+
+        # 计算色差(ΔE)
+        error = np.sqrt(np.sum((BT2020_xyz - display_xyz) ** 2))
+        total_error += error
+        max_error = max(max_error, error)
+        min_error = min(min_error, error)
+
+        # 格式化输出
+        color_name = f"颜色{i+1}"
+        BT2020_str = f"({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})"
+        target_str = f"({display_rgb[0]:.2f}, {display_rgb[1]:.2f}, {display_rgb[2]:.2f})"
+        print(f"{color_name}\t{BT2020_str}\t{target_str}\t{error:.4f}")
+
+        results.append({
+            'BT2020': color,
+            'target': display_rgb,
+            'error': error
+        })
+
+    # 计算统计信息
+    avg_error = total_error / len(test_colors)
+    
+    print("\n统计信息：")
+    print("=" * 50)
+    print(f"平均色差(ΔE): {avg_error:.4f}")
+    print(f"最大色差(ΔE): {max_error:.4f}")
+    print(f"最小色差(ΔE): {min_error:.4f}")
+    print(f"色差标准差: {np.std([r['error'] for r in results]):.4f}")
+
+    return results
 
 
 def visualize_color_mapping():
@@ -237,7 +308,7 @@ def visualize_color_mapping():
                 # 简单转换
                 simple_display_rgb = convert_color_bt2020_to_display(bt2020_rgb)
                 # 优化转换
-                optimized_display_rgb = optimize_conversion(bt2020_rgb)
+                optimized_display_rgb = convert_bt2020_to_display(bt2020_rgb)
 
                 # 添加到颜色列表
                 original_colors.append(bt2020_rgb)
@@ -327,18 +398,26 @@ def compare_color_patches():
     """比较原始颜色和映射后颜色的视觉效果"""
     # 创建一些测试颜色
     test_colors = [
-        np.array([1.0, 0.0, 0.0]),  # 纯R
-        np.array([0.0, 1.0, 0.0]),  # 纯G
-        np.array([0.5, 0.5, 0.0]),  # RG混合
-        np.array([0.5, 0.0, 0.5]),  # RB混合
-        np.array([0.4, 0.3, 0.3]),  # 均匀混合
-        np.array([0.5, 0.3, 0.2]),  # 复杂混合1
-        np.array([0.2, 0.4, 0.4]),  # 复杂混合2
-        np.array([0.3, 0.2, 0.5]),  # 复杂混合4
+        (1.0, 0.0, 0.0),  # 纯红
+        (0.0, 1.0, 0.0),  # 纯绿
+        (0.0, 0.0, 1.0),  # 纯蓝
+        (1.0, 1.0, 0.0),  # 黄
+        (0.0, 1.0, 1.0),  # 青
+        (1.0, 0.0, 1.0),  # 洋红
+        (0.5, 0.0, 0.0),  # 暗红
+        (0.0, 0.5, 0.0),  # 暗绿
+        (0.0, 0.0, 0.5),  # 暗蓝
+        (0.5, 0.5, 0.0),  # 橄榄
+        (0.0, 0.5, 0.5),  # 蓝绿
+        (0.5, 0.0, 0.5),  # 紫
+        (0.5, 0.5, 0.5),  # 灰
+        (1.0, 0.5, 0.0),  # 橙
+        (0.0, 0.5, 1.0),  # 天蓝
+        (1.0, 0.0, 0.5),  # 粉红
     ]
 
     # 进行颜色转换
-    mapped_colors = [optimize_conversion(np.array(color)) for color in test_colors]
+    mapped_colors = [convert_bt2020_to_display(np.array(color)) for color in test_colors]
 
     # 创建显示图
     fig, axes = plt.subplots(len(test_colors), 2, figsize=(8, 2 * len(test_colors)))
@@ -361,72 +440,396 @@ def compare_color_patches():
 
     return plt.gcf()
 
-def analyze_conversion_accuracy():
-    """分析4通道到5通道转换的精度"""
-    # 创建测试颜色集
-    test_colors = [
-        np.array([1.0, 0.0, 0.0]),  # 纯R
-        np.array([0.0, 1.0, 0.0]),  # 纯G
-        np.array([0.5, 0.5, 0.0]),  # RG混合
-        np.array([0.5, 0.0, 0.5]),  # RB混合
-        np.array([0.4, 0.3, 0.3]),  # 均匀混合
-        np.array([0.5, 0.3, 0.2]),  # 复杂混合1
-        np.array([0.2, 0.4, 0.4]),  # 复杂混合2
-        np.array([0.3, 0.2, 0.5]),  # 复杂混合4
-    ]
+BT2020_matrix, DISPLAY_matrix, BT2020_to_display_matrix = compute_primary_matrix()
 
-    # 获取颜色矩阵
-    BT2020_matrix, DISPLAY_matrix, _ = compute_primary_matrix()
+# 定义 MLP 模型，使用 Hardtanh 激活函数, 保证输出为[0,1]
+class MLP(nn.Module):
+    def __init__(self):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(3, 10)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(10, 3)
+        #self.dropout = nn.Dropout(p=0.5)  # 添加 Dropout 层
+        self.hardtanh = nn.Hardtanh()
 
-    # 存储结果
-    results = []
-    total_error = 0
-    max_error = 0
-    min_error = float('inf')
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        # 将 Hardtanh 的输出从 [-1, 1] 映射到 [0, 1]
+        #x = self.dropout(x)
+        x = (self.hardtanh(x) + 1) / 2
+        return x
 
-    print("\n转换精度分析结果：")
-    print("=" * 50)
-    print("颜色\t\t\t源RGBV\t\t\t目标rgb\t\t\t色差(ΔE)")
-    print("-" * 100)
 
-    for i, color in enumerate(test_colors):
-        # 转换到5通道
-        display_rgb = optimize_conversion(color)
+# def BT2020rgb_to_xy(rgb):
+#     if len(rgb.shape) == 1:
+#         rgb = np.expand_dims(rgb, axis=0)
+#     xy_list = []
+#     for r, g, b in rgb:
+#         xyz  = np.dot(BT2020_matrix, np.array([r, g, b]))
+#         x, y = XYZ_to_xy(*xyz)
+#         xy_list.append([x, y])
+#     return np.array(xy_list)
 
-        # 计算原始颜色和目标颜色的XYZ值
-        BT2020_xyz = np.dot(BT2020_matrix, color)
-        display_xyz = np.dot(DISPLAY_matrix, display_rgb)
-
-        # 计算色差(ΔE)
-        error = np.sqrt(np.sum((BT2020_xyz - display_xyz) ** 2))
-        total_error += error
-        max_error = max(max_error, error)
-        min_error = min(min_error, error)
-
-        # 格式化输出
-        color_name = f"颜色{i+1}"
-        BT2020_str = f"({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})"
-        target_str = f"({display_rgb[0]:.2f}, {display_rgb[1]:.2f}, {display_rgb[2]:.2f})"
-        print(f"{color_name}\t{BT2020_str}\t{target_str}\t{error:.4f}")
-
-        results.append({
-            'BT2020': color,
-            'target': display_rgb,
-            'error': error
-        })
-
-    # 计算统计信息
-    avg_error = total_error / len(test_colors)
+# def displayrgb_to_xy(rgb):
+#     if len(rgb.shape) == 1:
+#         rgb = np.expand_dims(rgb, axis=0)
+#     xy_list = []
+#     for r, g, b in rgb:
+#         xyz  = np.dot(DISPLAY_matrix, np.array([r, g, b]))
+#         x, y = XYZ_to_xy(*xyz)
+#         xy_list.append([x, y])
+#     return np.array(xy_list)
+def BT2020rgb_to_xy(rgb: torch.Tensor) -> torch.Tensor:
+    """
+    将BT2020 RGB颜色值转换为CIE xy色度坐标
+    参数:
+        rgb: 形状为 (..., 3) 的PyTorch张量，表示RGB颜色值
+    返回:
+        xy: 形状为 (..., 2) 的PyTorch张量，表示xy色度坐标
+    """
+    # 确保输入是正确的形状
+    if rgb.dim() == 1:
+        rgb = rgb.unsqueeze(0)  # 添加批次维度
     
-    print("\n统计信息：")
-    print("=" * 50)
-    print(f"平均色差(ΔE): {avg_error:.4f}")
-    print(f"最大色差(ΔE): {max_error:.4f}")
-    print(f"最小色差(ΔE): {min_error:.4f}")
-    print(f"色差标准差: {np.std([r['error'] for r in results]):.4f}")
+    # 将矩阵转换为PyTorch张量
+    BT2020_matrix_tensor = torch.tensor(BT2020_matrix, dtype=rgb.dtype, device=rgb.device)
+    
+    # 执行矩阵乘法：RGB到XYZ
+    # 假设BT2020_matrix是3x3矩阵，rgb是(..., 3)张量
+    xyz = torch.matmul(rgb, BT2020_matrix_tensor.T)  # (..., 3)
+    
+    # 计算xy坐标
+    sum_xyz = torch.sum(xyz, dim=-1, keepdim=True)  # (..., 1)
+    x = xyz[..., 0:1] / (sum_xyz + 1e-8)  # (..., 1)
+    y = xyz[..., 1:2] / (sum_xyz + 1e-8)  # (..., 1)
+    
+    return torch.cat([x, y], dim=-1)  # (..., 2)
 
-    return results
+def displayrgb_to_xy(rgb: torch.Tensor) -> torch.Tensor:
+    """
+    将显示屏RGB颜色值转换为CIE xy色度坐标
+    参数:
+        rgb: 形状为 (..., 3) 的PyTorch张量，表示RGB颜色值
+    返回:
+        xy: 形状为 (..., 2) 的PyTorch张量，表示xy色度坐标
+    """
+    # 确保输入是正确的形状
+    if rgb.dim() == 1:
+        rgb = rgb.unsqueeze(0)  # 添加批次维度
+    
+    # 将矩阵转换为PyTorch张量
+    DISPLAY_matrix_tensor = torch.tensor(DISPLAY_matrix, dtype=rgb.dtype, device=rgb.device)
+    
+    # 执行矩阵乘法：RGB到XYZ
+    xyz = torch.matmul(rgb, DISPLAY_matrix_tensor.T)  # (..., 3)
+    
+    # 计算xy坐标
+    sum_xyz = torch.sum(xyz, dim=-1, keepdim=True)  # (..., 1)
+    x = xyz[..., 0:1] / (sum_xyz + 1e-8)  # (..., 1)
+    y = xyz[..., 1:2] / (sum_xyz + 1e-8)  # (..., 1)
+    
+    return torch.cat([x, y], dim=-1)  # (..., 2)
 
+# 定义基于 PyTorch 的色差计算函数
+def color_difference_torch(rgb1, rgb2):
+    # 确保输入是张量
+    if not isinstance(rgb1, torch.Tensor):
+        rgb1 = torch.tensor(rgb1, dtype=torch.float32)
+    if not isinstance(rgb2, torch.Tensor):
+        rgb2 = torch.tensor(rgb2, dtype=torch.float32)
+        
+    # 计算欧氏距离（简化版，实际应使用 CIEDE2000 的 PyTorch 实现）
+    return torch.sqrt(torch.sum((rgb1 - rgb2) ** 2))
+
+def XYZ_to_Lab(XYZ: torch.Tensor) -> torch.Tensor:
+    """
+    将 XYZ 颜色空间转换为 Lab 颜色空间（PyTorch 实现）
+    """
+    # CIE 标准照明体 D65
+    Xn, Yn, Zn = 95.047, 100.000, 108.883
+    
+    # 归一化
+    XYZ_norm = XYZ / torch.tensor([Xn, Yn, Zn], device=XYZ.device, dtype=XYZ.dtype)
+    
+    # 非线性变换
+    def f(t):
+        delta = 6/29
+        return torch.where(t > delta**3, 
+                          torch.pow(t, 1/3), 
+                          t/(3 * delta**2) + 4/29)
+    
+    f_XYZ = f(XYZ_norm)
+    
+    # 计算 Lab
+    L = 116 * f_XYZ[..., 1] - 16
+    a = 500 * (f_XYZ[..., 0] - f_XYZ[..., 1])
+    b = 200 * (f_XYZ[..., 1] - f_XYZ[..., 2])
+    
+    return torch.stack([L, a, b], dim=-1)
+
+def delta_e_cie2000_torch(Lab1: torch.Tensor, Lab2: torch.Tensor) -> torch.Tensor:
+    """
+    计算两个 Lab 颜色之间的 CIEDE2000 色差（PyTorch 实现）
+    """
+    # 提取 L, a, b 分量
+    L1, a1, b1 = Lab1[..., 0], Lab1[..., 1], Lab1[..., 2]
+    L2, a2, b2 = Lab2[..., 0], Lab2[..., 1], Lab2[..., 2]
+    
+    # 计算 CIE94 中的 C*ab
+    C1_ab = torch.sqrt(a1**2 + b1**2)
+    C2_ab = torch.sqrt(a2**2 + b2**2)
+    
+    # 计算平均 C*ab
+    C_ab_mean = (C1_ab + C2_ab) / 2
+    
+    # 创建常量张量而不使用 torch.tensor
+    const_25 = C_ab_mean.new_full((), 25.0)
+    const_1e10 = C_ab_mean.new_full((), 1e-10)
+    
+    # 安全计算 G 参数
+    C_ab_mean_p7 = torch.pow(C_ab_mean, 7)
+    denominator = C_ab_mean_p7 + torch.pow(const_25, 7) + const_1e10
+    G = 0.5 * (1 - torch.sqrt(C_ab_mean_p7 / denominator))
+    
+    # 计算调整后的 a'
+    a1_prime = (1 + G) * a1
+    a2_prime = (1 + G) * a2
+    
+    # 计算 C'
+    C1_prime = torch.sqrt(a1_prime**2 + b1**2)
+    C2_prime = torch.sqrt(a2_prime**2 + b2**2)
+    
+    # 计算平均 C'
+    C_prime_mean = (C1_prime + C2_prime) / 2
+    
+    # 计算 h'
+    def calculate_h_prime(a_prime, b):
+        h_prime = torch.atan2(b, a_prime) * (180 / np.pi)
+        h_prime = h_prime % 360
+        return torch.where(h_prime < 0, h_prime + 360, h_prime)
+    
+    h1_prime = calculate_h_prime(a1_prime, b1)
+    h2_prime = calculate_h_prime(a2_prime, b2)
+    
+    # 计算 Δh'
+    delta_h_prime = torch.zeros_like(h1_prime)
+    
+    mask1 = (torch.abs(h1_prime - h2_prime) <= 180)
+    delta_h_prime[mask1] = h2_prime[mask1] - h1_prime[mask1]
+    
+    mask2 = (h1_prime - h2_prime > 180)
+    delta_h_prime[mask2] = h2_prime[mask2] - h1_prime[mask2] + 360
+    
+    mask3 = (h1_prime - h2_prime < -180)
+    delta_h_prime[mask3] = h2_prime[mask3] - h1_prime[mask3] - 360
+    
+    # 计算 ΔL', ΔC', ΔH'
+    delta_L_prime = L2 - L1
+    delta_C_prime = C2_prime - C1_prime
+    delta_H_prime = 2 * torch.sqrt(C1_prime * C2_prime) * torch.sin(delta_h_prime * (np.pi / 180) / 2)
+    
+    # 计算平均 L', C', h'
+    L_prime_mean = (L1 + L2) / 2
+    C_prime_mean = (C1_prime + C2_prime) / 2
+    
+    # 计算平均 h'
+    h_prime_mean = torch.zeros_like(h1_prime)
+    
+    mask4 = (torch.abs(h1_prime - h2_prime) <= 180)
+    h_prime_mean[mask4] = (h1_prime[mask4] + h2_prime[mask4]) / 2
+    
+    mask5 = ((h1_prime + h2_prime) < 360) & (torch.abs(h1_prime - h2_prime) > 180)
+    h_prime_mean[mask5] = (h1_prime[mask5] + h2_prime[mask5] + 360) / 2
+    
+    mask6 = ((h1_prime + h2_prime) >= 360) & (torch.abs(h1_prime - h2_prime) > 180)
+    h_prime_mean[mask6] = (h1_prime[mask6] + h2_prime[mask6] - 360) / 2
+    
+    # 计算各项修正因子
+    T = 1 - 0.17 * torch.cos((h_prime_mean - 30) * (np.pi / 180)) + \
+        0.24 * torch.cos((2 * h_prime_mean) * (np.pi / 180)) + \
+        0.32 * torch.cos((3 * h_prime_mean + 6) * (np.pi / 180)) - \
+        0.20 * torch.cos((4 * h_prime_mean - 63) * (np.pi / 180))
+    
+    delta_theta = 30 * torch.exp(-torch.pow((h_prime_mean - 275) / 25, 2))
+    
+    # 安全计算 RC
+    C_prime_mean_p7 = torch.pow(C_prime_mean, 7)
+    RC_denominator = C_prime_mean_p7 + torch.pow(const_25, 7) + const_1e10
+    RC = 2 * torch.sqrt(C_prime_mean_p7 / RC_denominator)
+    
+    # 安全计算 SL
+    L_diff_squared = torch.pow(L_prime_mean - 50, 2)
+    SL_denominator = torch.sqrt(20 + L_diff_squared) + const_1e10
+    SL = 1 + (0.015 * L_diff_squared) / SL_denominator
+    
+    SC = 1 + 0.045 * C_prime_mean
+    SH = 1 + 0.015 * C_prime_mean * T
+    
+    RT = -RC * torch.sin(2 * delta_theta * (np.pi / 180))
+    
+    # 计算最终色差
+    delta_E = torch.sqrt(
+        torch.pow(delta_L_prime / SL, 2) +
+        torch.pow(delta_C_prime / SC, 2) +
+        torch.pow(delta_H_prime / SH, 2) +
+        RT * (delta_C_prime / SC) * (delta_H_prime / SH)
+    )
+    
+    return delta_E
+
+# 检查是否有可用的 GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 生成训练数据
+num_samples = 1000
+bt2020_rgb_train = np.random.uniform(0, 1, (num_samples, 3))
+# # 对每个样本进行归一化，确保每个样本的 RGB 分量之和为 1
+# bt2020_rgb_train = bt2020_rgb_train / np.sum(bt2020_rgb_train, axis=1).reshape(-1, 1)
+bt2020_rgb_train = torch.tensor(bt2020_rgb_train, dtype=torch.float32).to(device)
+
+# 创建数据集和数据加载器
+batch_size = 32  # 小批量的大小
+dataset = TensorDataset(bt2020_rgb_train)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# 初始化 MLP 模型并移动到 GPU
+model = MLP().to(device)
+
+# 定义优化器为 SGD
+# optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# 存储每个 epoch 的损失
+losses = []
+
+# 训练模型
+num_epochs = 200
+for epoch in tqdm(range(num_epochs)):
+    epoch_loss = 0
+    for batch in dataloader:
+        bt2020_rgb_batch = batch[0]
+        outputs = model(bt2020_rgb_batch)
+
+        # 计算输入和输出的 xy 值
+        bt2020_xy = BT2020rgb_to_xy(bt2020_rgb_batch)
+        output_xy = displayrgb_to_xy(outputs)
+
+        # 计算 CIEDE2000 色差
+        # 将xy转换为XYZ (假设Y=1)
+        bt2020_XYZ = torch.stack([
+            bt2020_xy[..., 0] * 1 / bt2020_xy[..., 1],
+            torch.ones_like(bt2020_xy[..., 0]),
+            (1 - bt2020_xy[..., 0] - bt2020_xy[..., 1]) * 1 / bt2020_xy[..., 1]
+        ], dim=-1)
+        
+        output_XYZ = torch.stack([
+            output_xy[..., 0] * 1 / output_xy[..., 1],
+            torch.ones_like(output_xy[..., 0]),
+            (1 - output_xy[..., 0] - output_xy[..., 1]) * 1 / output_xy[..., 1]
+        ], dim=-1)
+        
+        # 将XYZ转换为Lab
+        bt2020_Lab = XYZ_to_Lab(bt2020_XYZ)
+        output_Lab = XYZ_to_Lab(output_XYZ)
+        
+        # 计算CIEDE2000色差
+        batch_loss = delta_e_cie2000_torch(bt2020_Lab, output_Lab).mean() #color_difference_torch(bt2020_xy,output_xy)
+        # batch_loss = 0
+        # for i in range(len(bt2020_rgb_batch)):
+        #     color1 = XYZColor(bt2020_xy[i, 0], bt2020_xy[i, 1], 1 - bt2020_xy[i, 0] - bt2020_xy[i, 1])
+        #     color2 = XYZColor(output_xy[i, 0], output_xy[i, 1], 1 - output_xy[i, 0] - output_xy[i, 1])
+        #     # 将 XYZColor 转换为 LabColor
+        #     lab_color1 = convert_color(color1, LabColor)
+        #     lab_color2 = convert_color(color2, LabColor)
+        #     batch_loss += delta_e_cie2000(lab_color1, lab_color2)
+        # batch_loss = batch_loss / len(bt2020_rgb_batch)
+        #batch_loss = color_difference_torch(bt2020_xy, output_xy)
+
+        optimizer.zero_grad()
+        batch_loss.backward()
+
+        # 检查是否有梯度更新
+        # with torch.no_grad():
+        #     has_grad = False
+        #     for name, param in model.named_parameters():
+        #         if param.grad is not None and torch.norm(param.grad) > 1e-8:
+        #             has_grad = True
+        #             print(f"参数 {name} 有梯度，范数: {torch.norm(param.grad):.6f}")
+            
+        #     if not has_grad:
+        #         print("警告：所有参数梯度为零！")
+    
+        optimizer.step()
+
+        epoch_loss += batch_loss.item()
+
+    epoch_loss = epoch_loss / len(dataloader)
+    losses.append(epoch_loss)
+
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}')
+
+# 保存模型参数
+torch.save(model.state_dict(), 'mlp_model.pth')
+print("模型参数已保存到 mlp_model.pth")
+
+# 绘制损失曲线
+import matplotlib.pyplot as plt
+plt.plot(range(1, num_epochs + 1), losses)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss Curve')
+plt.savefig('loss_curve.png')
+print("损失曲线已保存为 loss_curve.png")
+
+# 定义颜色转换函数
+def convert_bt2020_to_display(bt2020_rgb):
+    display_rgb = np.dot(BT2020_to_display_matrix, bt2020_rgb)
+    # return display_rgb.clip(0, 1)
+
+    if np.all((display_rgb >= 0) & (display_rgb <= 1)): #如果在范围内，说明得到合理的显示器RGB值，在重合区域，直接返回
+        display_rgb = display_rgb
+    else:
+        bt2020_rgb_tensor = torch.tensor(bt2020_rgb, dtype=torch.float32).to(device)
+        display_rgb_tensor = model(bt2020_rgb_tensor)
+        # 将 GPU 上的张量移动到 CPU 上，再转换为 NumPy 数组
+        display_rgb = display_rgb_tensor.cpu().detach().numpy()
+
+    # 确保输出在0 - 1之间
+    display_rgb = np.clip(display_rgb, 0, 1)
+    return display_rgb
+
+def test_mlp_model(rgb_values, model_path='mlp_model.pth'):
+    """
+    加载保存的模型参数并处理输入的 RGB 值。
+    :param rgb_values: 输入的 RGB 值，形状为 (n, 3) 的 numpy 数组或列表
+    :param model_path: 保存的模型参数文件路径
+    :return: 处理后的 RGB 值，形状为 (n, 3) 的 numpy 数组
+    """
+    def convert(bt2020_rgb, mlpmodel):
+        display_rgb = np.dot(BT2020_to_display_matrix, bt2020_rgb)
+
+        if np.all((display_rgb >= 0) & (display_rgb <= 1)): #如果在范围内，说明得到合理的显示器RGB值，在重合区域，直接返回
+            display_rgb = display_rgb
+        else:
+            bt2020_rgb_tensor = torch.tensor(bt2020_rgb, dtype=torch.float32)
+            display_rgb_tensor = mlpmodel(bt2020_rgb_tensor)
+            display_rgb = display_rgb_tensor.detach().numpy()
+
+        # 确保输出在0 - 1之间
+        display_rgb = np.clip(display_rgb, 0, 1)
+        return display_rgb
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MLP().to(device)
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+    except FileNotFoundError:
+        print(f"错误: 未找到模型文件 {model_path}")
+        return None
+    return convert(rgb_values, model)
 
 def main():
     # 绘制色彩空间
@@ -463,7 +866,7 @@ def main():
         f.write("2. 关键颜色转换测试\n")
         for color in test_colors:
             display_rgb = convert_color_bt2020_to_display(color)
-            optimized_rgb = optimize_conversion(color)
+            optimized_rgb = convert_bt2020_to_display(color)
             f.write(f"\nBT2020 RGB: {color}\n")
             f.write(f"简单转换后RGB: {display_rgb}\n")
             f.write(f"优化后RGB: {optimized_rgb}\n")
