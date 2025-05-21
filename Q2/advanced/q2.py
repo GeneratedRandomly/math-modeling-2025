@@ -1,13 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.path import Path
 from matplotlib.patches import Polygon
 from scipy.optimize import minimize, linprog
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.colors as mcolors
-from matplotlib.patches import Polygon as Polygon2D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import matplotlib as mpl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,7 +55,6 @@ def XYZ_to_xy(X, Y, Z):
 def plot_color_spaces_4to5():
     """绘制CIE 1931色彩空间，以及4通道源和5通道显示的色域"""
     # 加载CIE 1931色度图数据(简化版)
-    wavelengths = np.arange(380, 700, 5)
     x = np.array(
         [
             0.1741,
@@ -856,23 +850,37 @@ class GamutProjection(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim=4, output_dim=5, hidden_dim=512):
+    def __init__(self, input_dim=4, output_dim=5, hidden_dim=512, reduction=8):
         super().__init__()
-        # 输入编码层
+
+        # 输入编码层（包含光谱注意力）
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            ChromaticAttention(channels=hidden_dim, reduction=reduction),  # 添加注意力
         )
 
-        # 特征转换层
+        # 特征转换层（包含光谱注意力）
         self.transformer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Dropout(0.2)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            ChromaticAttention(channels=hidden_dim, reduction=reduction),  # 添加注意力
+            nn.Dropout(0.2),
         )
 
         # 输出解码层
-        self.decoder = nn.Sequential(nn.Linear(hidden_dim, output_dim))
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            ChromaticAttention(
+                channels=hidden_dim // 2, reduction=reduction // 2
+            ),  # 输出前注意力
+            nn.Linear(hidden_dim // 2, output_dim),
+        )
 
-        # 色域投影层（显示设备矩阵应为3x5）
-        self.gamut_layer = GamutProjection()  # 直接传入原始矩阵
+        # 色域投影层
+        self.gamut_layer = GamutProjection()
 
     def forward(self, x):
         # 输入标准化
@@ -881,13 +889,13 @@ class MLP(nn.Module):
         # 特征编码
         x = self.encoder(x)
 
-        # 特征变换
-        x = self.transformer(x) + x  # 残差连接
+        # 特征变换（带残差连接）
+        x = self.transformer(x) + x
 
-        # 解码输出（5通道）
+        # 解码输出
         x = self.decoder(x)
 
-        # 色域投影（保持5通道）
+        # 色域投影
         return self.gamut_layer(x).clamp(0, 1)
 
 
@@ -1274,7 +1282,6 @@ torch.save(model.state_dict(), "mlp_model.pth")
 print("模型参数已保存到 mlp_model.pth")
 
 # 绘制损失曲线
-import matplotlib.pyplot as plt
 
 plt.plot(range(1, num_epochs + 1), losses)
 plt.xlabel("Epoch")
@@ -1382,7 +1389,6 @@ def visualize_color_mapping():
     plt.figure(figsize=(12, 10))
 
     # 绘制CIE 1931马蹄形曲线(简化)
-    wavelengths = np.arange(380, 700, 5)
     x = np.array(
         [
             0.1741,
